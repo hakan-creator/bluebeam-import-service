@@ -1,5 +1,6 @@
 from fastapi import FastAPI, Header, HTTPException
 from pydantic import BaseModel
+from urllib.parse import quote
 import os, requests, xml.etree.ElementTree as ET, zlib, binascii, re
 from typing import Optional, List
 
@@ -113,7 +114,8 @@ def map_tool_kind(it: Optional[str]) -> str:
 
 def sb_download(supabase_url: str, service_key: str, bucket: str, path: str) -> str:
     """Download file from Supabase Storage via signed URL."""
-    url = f"{supabase_url}/storage/v1/object/sign/{bucket}/{path}"
+    encoded_path = quote(path, safe="/")
+    url = f"{supabase_url}/storage/v1/object/sign/{bucket}/{encoded_path}"
     r = requests.post(url, headers=sb_headers(service_key), json={"expiresIn": 300})
     if r.status_code >= 300:
         raise RuntimeError(f"Failed signed URL: {r.status_code} {r.text}")
@@ -141,7 +143,6 @@ def sb_insert(supabase_url: str, service_key: str, table: str, row: dict) -> dic
 def sb_delete_where(supabase_url: str, service_key: str, table: str, where: str):
     url = f"{supabase_url}/rest/v1/{table}?{where}"
     r = requests.delete(url, headers=sb_headers(service_key))
-    # Ignore 404/empty — fine if nothing to delete
 
 
 @app.post("/import-bpx")
@@ -222,7 +223,6 @@ def import_bpx(req: ImportReq, authorization: str = Header(default="")):
             })
             tools_imported += 1
 
-            # Create preset
             preset = {
                 "project_id": req.project_id,
                 "name": name,
