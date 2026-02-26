@@ -1,26 +1,30 @@
 from fastapi import FastAPI, Header, HTTPException
 from pydantic import BaseModel
 import os, requests, xml.etree.ElementTree as ET, zlib, binascii, re
-from typing import Optional
+from typing import Optional, List
 
 app = FastAPI(title="Bluebeam BPX Import Service")
 
 IMPORT_API_KEY = os.environ.get("IMPORT_SERVICE_API_KEY", "")
-SUPABASE_URL = os.environ["SUPABASE_URL"]
-SUPABASE_SERVICE_KEY = os.environ["SUPABASE_SERVICE_ROLE_KEY"]
+
 
 class ImportReq(BaseModel):
-    project_id: str
-    profile_id: str
+    project_id: Optional[str] = None
     storage_bucket: str = "imports"
     storage_path: str
+    filename: str = "unknown.bpx"
+    supabase_url: str
+    supabase_service_role_key: str
 
-def sb_headers():
+
+def sb_headers(service_key: str):
     return {
-        "apikey": SUPABASE_SERVICE_KEY,
-        "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}",
+        "apikey": service_key,
+        "Authorization": f"Bearer {service_key}",
         "Content-Type": "application/json",
+        "Prefer": "return=representation",
     }
+
 
 def decode_hex_zlib(hex_str: str) -> str:
     hex_str = (hex_str or "").strip()
@@ -30,125 +34,160 @@ def decode_hex_zlib(hex_str: str) -> str:
     out = zlib.decompress(raw)
     return out.decode("utf-8", errors="replace")
 
+
 def extract_pdf_dict_fields(raw: str):
-    # Minimal extraction: Subj + IT + color/opacity/line width/dash
     subj = None
     m = re.search(r"/Subj\((.*?)\)", raw)
-    if m: subj = m.group(1)
+    if m:
+        subj = m.group(1)
 
     it = None
     m = re.search(r"/IT/([A-Za-z0-9]+)", raw)
-    if m: it = m.group(1)
+    if m:
+        it = m.group(1)
 
     def extract_array(key):
-        m = re.search(rf"/{key}\s*\[\s*([0-9\.\s]+)\]", raw)
-        if not m: 
+        m2 = re.search(rf"/{key}\s*\[\s*([0-9.\s]+)\]", raw)
+        if not m2:
             return None
-        vals = [float(x) for x in m.group(1).split() if x.strip()]
-        return vals
+        return [float(x) for x in m2.group(1).split() if x.strip()]
 
     def extract_num(key):
-        m = re.search(rf"/{key}\s+([0-9\.]+)", raw)
-        return float(m.group(1)) if m else None
+        m2 = re.search(rf"/{key}\s+([0-9.]+)", raw)
+        return float(m2.group(1)) if m2 else None
 
     style = {}
-    C = extract_array("C")   # stroke RGB 0..1
-    IC = extract_array("IC") # fill RGB 0..1
-    CA = extract_num("CA")   # opacity 0..1
-    LW = extract_num("LW")   # line width
-    D = None
-    md = re.search(r"/D\s*\[\s*([0-9\.\s]+)\]", raw)  # dash array sometimes
-    if md:
-        D = [float(x) for x in md.group(1).split() if x.strip()]
+    C = extract_array("C")
+    IC = extract_array("IC")
+    CA = extract_num("CA")
+    LW = extract_num("LW")
 
-    if C: style["stroke_rgb"] = C[:3]
-    if IC: style["fill_rgb"] = IC[:3]
-    if CA is not None: style["opacity"] = CA
-    if LW is not None: style["line_width"] = LW
-    if D: style["dash"] = D
+    md = re.search(r"/D\s*\[\s*([0-9.\s]+)\]", raw)
+    D = [float(x) for x in md.group(1).split() if x.strip()] if md else None
+
+    if C:
+        style["stroke_rgb"] = C[:3]
+    if IC:
+        style["fill_rgb"] = IC[:3]
+    if CA is not None:
+        style["opacity"] = CA
+    if LW is not None:
+        style["line_width"] = LW
+    if D:
+        style["dash"] = D
 
     return subj, it, style
+
+
+TYPE_MAP = {
+    "annotationpolyline": "length",
+    "annotationline": "length",
+    "annotationlength": "length",
+    "annotationmeasureperimeter": "length",
+    "annotationpolygon": "area",
+    "annotationarea": "area",
+    "annotationrectangle": "area",
+    "annotationsquare": "area",
+    "annotationcount": "count",
+    "annotationcloudplus": "count",
+}
+
+SKIP_TYPES = {
+    "annotationbrxstamp",
+    "annotationcircle",
+    "annotationimage",
+    "annotationstamp",
+    "annotationfreetext",
+    "annotationcallout",
+}
+
 
 def map_tool_kind(it: Optional[str]) -> str:
     if not it:
         return "count"
-    s = it.lower()
-    if "polyline" in s:
-        return "length"
-    if "polygon" in s:
-        return "area"
-    return "count"
+    short = it.split(".")[-1].lower()
+    if short in SKIP_TYPES:
+        return "skip"
+    return TYPE_MAP.get(short, "count")
 
-def supabase_download_signed_url(bucket: str, path: str, expires_in: int = 300) -> str:
-    url = f"{SUPABASE_URL}/storage/v1/object/sign/{bucket}/{path}"
-    r = requests.post(url, headers=sb_headers(), json={"expiresIn": expires_in})
+
+def sb_download(supabase_url: str, service_key: str, bucket: str, path: str) -> str:
+    """Download file from Supabase Storage via signed URL."""
+    url = f"{supabase_url}/storage/v1/object/sign/{bucket}/{path}"
+    r = requests.post(url, headers=sb_headers(service_key), json={"expiresIn": 300})
     if r.status_code >= 300:
         raise RuntimeError(f"Failed signed URL: {r.status_code} {r.text}")
-    return r.json()["signedURL"]
+    signed = r.json()["signedURL"]
+    file_url = f"{supabase_url}{signed}" if signed.startswith("/") else signed
+    fr = requests.get(file_url)
+    if fr.status_code >= 300:
+        raise RuntimeError(f"Failed to download file: {fr.status_code}")
+    return fr.text
 
-def supabase_insert(table: str, rows):
-    url = f"{SUPABASE_URL}/rest/v1/{table}"
-    r = requests.post(url, headers=sb_headers(), json=rows)
+
+def sb_insert(supabase_url: str, service_key: str, table: str, row: dict) -> dict:
+    """Insert a row and return it (with generated id)."""
+    url = f"{supabase_url}/rest/v1/{table}"
+    r = requests.post(url, headers=sb_headers(service_key), json=row)
     if r.status_code >= 300:
         raise RuntimeError(f"Insert {table} failed: {r.status_code} {r.text}")
-    return r.json() if r.text else None
+    data = r.json()
+    return data[0] if isinstance(data, list) and data else data
 
-def supabase_delete_where(table: str, where: str):
-    url = f"{SUPABASE_URL}/rest/v1/{table}?{where}"
-    r = requests.delete(url, headers=sb_headers())
-    if r.status_code >= 300:
-        raise RuntimeError(f"Delete {table} failed: {r.status_code} {r.text}")
+
+def sb_delete_where(supabase_url: str, service_key: str, table: str, where: str):
+    url = f"{supabase_url}/rest/v1/{table}?{where}"
+    r = requests.delete(url, headers=sb_headers(service_key))
+    # Ignore 404/empty — fine if nothing to delete
+
 
 @app.post("/import-bpx")
 def import_bpx(req: ImportReq, authorization: str = Header(default="")):
     if not IMPORT_API_KEY or authorization != f"Bearer {IMPORT_API_KEY}":
         raise HTTPException(status_code=401, detail="Unauthorized")
 
-    # Download BPX from Supabase Storage via signed URL
-    signed = supabase_download_signed_url(req.storage_bucket, req.storage_path, 300)
-    file_url = f"{SUPABASE_URL}{signed}" if signed.startswith("/") else signed
-    fr = requests.get(file_url)
-    if fr.status_code >= 300:
-        raise HTTPException(status_code=400, detail=f"Failed to download BPX: {fr.text}")
-    xml_text = fr.text
+    base = req.supabase_url
+    key = req.supabase_service_role_key
 
-    # OPTIONAL: clear previous toolsets/tools for this profile (re-import)
-    # This relies on FK cascade: delete toolsets by profile_id -> tools cascade.
-    supabase_delete_where("bluebeam_toolsets", f"profile_id=eq.{req.profile_id}")
+    # 1. Download BPX from Storage
+    xml_text = sb_download(base, key, req.storage_bucket, req.storage_path)
 
+    # 2. Create bluebeam_profile
+    profile = sb_insert(base, key, "bluebeam_profiles", {
+        "project_id": req.project_id,
+        "filename": req.filename,
+        "version_label": None,
+        "created_by": "00000000-0000-0000-0000-000000000000",  # service-level
+    })
+    profile_id = profile["id"]
+
+    # 3. Parse BPX XML
     root = ET.fromstring(xml_text)
-    ns = ""  # BPX often has no namespaces; keep simple
-
-    toolsets = root.findall(".//BluebeamRevuToolSet")
     toolsets_imported = 0
     tools_imported = 0
     presets_created = 0
-    warnings = []
+    warnings: List[str] = []
 
-    for ts_idx, ts in enumerate(toolsets):
+    toolset_els = root.findall(".//BluebeamRevuToolSet")
+
+    for ts_idx, ts in enumerate(toolset_els):
         title_hex = ts.findtext("Title") or ""
         try:
-            title = decode_hex_zlib(title_hex) if title_hex else f"Toolset {ts_idx+1}"
+            title = decode_hex_zlib(title_hex) if title_hex else f"Toolset {ts_idx + 1}"
         except Exception:
-            title = f"Toolset {ts_idx+1}"
+            title = f"Toolset {ts_idx + 1}"
             warnings.append(f"Failed decoding toolset title at index {ts_idx}")
 
-        toolset_row = {
-            "profile_id": req.profile_id,
+        if title in ("Recent Tools", "Seneste vaerktoejer"):
+            continue
+
+        ts_row = sb_insert(base, key, "bluebeam_toolsets", {
+            "profile_id": profile_id,
             "title": title,
             "sort_index": ts_idx,
             "source_path": None,
-        }
-        supabase_insert("bluebeam_toolsets", toolset_row)
-        # Fetch created toolset id: simplest is to query back; but we can store via returning=representation if needed.
-        # For simplicity, re-select by (profile_id,title,sort_index)
-        q = requests.get(
-            f"{SUPABASE_URL}/rest/v1/bluebeam_toolsets"
-            f"?profile_id=eq.{req.profile_id}&sort_index=eq.{ts_idx}&select=id",
-            headers=sb_headers(),
-        )
-        toolset_id = q.json()[0]["id"]
-
+        })
+        toolset_id = ts_row["id"]
         toolsets_imported += 1
 
         items = ts.findall(".//ToolChestItem")
@@ -159,42 +198,49 @@ def import_bpx(req: ImportReq, authorization: str = Header(default="")):
             try:
                 raw = decode_hex_zlib(raw_hex)
             except Exception:
-                warnings.append(f"Failed decoding tool raw in toolset '{title}', item {i}")
+                warnings.append(f"Failed decoding tool in '{title}', item {i}")
                 continue
 
             subj, it, style = extract_pdf_dict_fields(raw)
-            name = subj or f"Tool {i+1}"
             tool_kind = map_tool_kind(it)
+            if tool_kind == "skip":
+                continue
 
-            tool_row = {
+            name = subj or f"Tool {i + 1}"
+
+            tool_row = sb_insert(base, key, "bluebeam_tools", {
                 "toolset_id": toolset_id,
                 "name": name,
                 "tool_kind": tool_kind,
                 "sort_index": i,
-                "raw_decoded": raw,       # keep for debug (can remove later)
+                "raw_decoded": raw[:4000],
                 "style_json": style,
-                "mapping_json": {"it": it, "source": "bpx"},
-            }
-            supabase_insert("bluebeam_tools", tool_row)
+                "mapping_json": {"it": it, "category": title},
+            })
             tools_imported += 1
 
-            # Also create a preset in our system (Tool Chest)
-            preset_row = {
+            # Create preset
+            preset = {
                 "project_id": req.project_id,
                 "name": name,
                 "tool_type": tool_kind,
                 "category": title,
-                "style_json": {**style, "imported_from": "bluebeam"},
-                "default_tags_json": {"imported_from": "bpx", "toolset": title},
-                "sort_index": i,
+                "style_json": style,
+                "default_tags_json": {},
+                "sort_index": ts_idx * 1000 + i,
+                "bluebeam_tool_id": tool_row["id"],
             }
-            supabase_insert("presets", preset_row)
-            presets_created += 1
+            try:
+                sb_insert(base, key, "presets", preset)
+                presets_created += 1
+            except Exception as e:
+                warnings.append(f"Failed preset for '{name}': {str(e)}")
 
     return {
-        "ok": True,
-        "toolsets_imported": toolsets_imported,
-        "tools_imported": tools_imported,
-        "presets_created": presets_created,
+        "profileId": profile_id,
+        "toolsetCount": toolsets_imported,
+        "toolCount": tools_imported,
+        "presetCount": presets_created,
+        "missingReferences": [],
         "warnings": warnings,
     }
