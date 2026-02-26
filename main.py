@@ -113,21 +113,17 @@ def map_tool_kind(it: Optional[str]) -> str:
 
 
 def sb_download(supabase_url: str, service_key: str, bucket: str, path: str) -> str:
-    """Download file from Supabase Storage via signed URL."""
+    """Download file from Supabase Storage directly using service role key."""
     encoded_path = quote(path, safe="/")
-    url = f"{supabase_url}/storage/v1/object/sign/{bucket}/{encoded_path}"
-    r = requests.post(url, headers=sb_headers(service_key), json={"expiresIn": 300})
+    url = f"{supabase_url}/storage/v1/object/{bucket}/{encoded_path}"
+    headers = {
+        "apikey": service_key,
+        "Authorization": f"Bearer {service_key}",
+    }
+    r = requests.get(url, headers=headers)
     if r.status_code >= 300:
-        raise RuntimeError(f"Failed signed URL: {r.status_code} {r.text}")
-    data = r.json()
-    signed = data.get("signedURL") or data.get("signedUrl") or ""
-    if not signed:
-        raise RuntimeError(f"No signedURL in response: {data}")
-    file_url = f"{supabase_url}{signed}" if signed.startswith("/") else signed
-    fr = requests.get(file_url)
-    if fr.status_code >= 300:
-        raise RuntimeError(f"Failed to download file: {fr.status_code} url={file_url}")
-    return fr.text
+        raise RuntimeError(f"Failed to download file: {r.status_code} url={url}")
+    return r.text
 
 
 def sb_insert(supabase_url: str, service_key: str, table: str, row: dict) -> dict:
