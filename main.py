@@ -117,11 +117,14 @@ def sb_download(supabase_url: str, service_key: str, bucket: str, path: str) -> 
     r = requests.post(url, headers=sb_headers(service_key), json={"expiresIn": 300})
     if r.status_code >= 300:
         raise RuntimeError(f"Failed signed URL: {r.status_code} {r.text}")
-    signed = r.json()["signedURL"]
+    data = r.json()
+    signed = data.get("signedURL") or data.get("signedUrl") or ""
+    if not signed:
+        raise RuntimeError(f"No signedURL in response: {data}")
     file_url = f"{supabase_url}{signed}" if signed.startswith("/") else signed
     fr = requests.get(file_url)
     if fr.status_code >= 300:
-        raise RuntimeError(f"Failed to download file: {fr.status_code}")
+        raise RuntimeError(f"Failed to download file: {fr.status_code} url={file_url}")
     return fr.text
 
 
@@ -157,7 +160,7 @@ def import_bpx(req: ImportReq, authorization: str = Header(default="")):
         "project_id": req.project_id,
         "filename": req.filename,
         "version_label": None,
-        "created_by": "00000000-0000-0000-0000-000000000000",  # service-level
+        "created_by": "00000000-0000-0000-0000-000000000000",
     })
     profile_id = profile["id"]
 
