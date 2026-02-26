@@ -1,7 +1,8 @@
 from fastapi import FastAPI, Header, HTTPException
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from urllib.parse import quote
-import os, requests, xml.etree.ElementTree as ET, zlib, binascii, re
+import os, requests, xml.etree.ElementTree as ET, zlib, binascii, re, traceback
 from typing import Optional, List
 
 app = FastAPI(title="Bluebeam BPX Import Service")
@@ -122,7 +123,7 @@ def sb_download(supabase_url: str, service_key: str, bucket: str, path: str) -> 
     }
     r = requests.get(url, headers=headers)
     if r.status_code >= 300:
-        raise RuntimeError(f"Failed to download file: {r.status_code} url={url}")
+        raise RuntimeError(f"Failed to download file: {r.status_code} url={url} body={r.text[:500]}")
     return r.text
 
 
@@ -131,7 +132,7 @@ def sb_insert(supabase_url: str, service_key: str, table: str, row: dict) -> dic
     url = f"{supabase_url}/rest/v1/{table}"
     r = requests.post(url, headers=sb_headers(service_key), json=row)
     if r.status_code >= 300:
-        raise RuntimeError(f"Insert {table} failed: {r.status_code} {r.text}")
+        raise RuntimeError(f"Insert {table} failed: {r.status_code} {r.text[:500]}")
     data = r.json()
     return data[0] if isinstance(data, list) and data else data
 
@@ -146,6 +147,18 @@ def import_bpx(req: ImportReq, authorization: str = Header(default="")):
     if not IMPORT_API_KEY or authorization != f"Bearer {IMPORT_API_KEY}":
         raise HTTPException(status_code=401, detail="Unauthorized")
 
+    try:
+        return _do_import(req)
+    except Exception as e:
+        tb = traceback.format_exc()
+        print(f"[import-bpx] ERROR: {e}\n{tb}")
+        return JSONResponse(
+            status_code=500,
+            content={"error": str(e), "traceback": tb},
+        )
+
+
+def _do_import(req: ImportReq):
     base = req.supabase_url
     key = req.supabase_service_role_key
 
